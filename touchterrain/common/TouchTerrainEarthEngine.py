@@ -39,6 +39,8 @@ from touchterrain.common.Coordinate_system_conv import * # arc to meters convers
 
 import numpy
 from PIL import Image
+from PIL import ImageFilter
+from scipy import ndimage
 
 # for reading/writing geotiffs
 # Later versions of gdal may be bundled into osgeo so check there as well.
@@ -50,6 +52,7 @@ except ImportError as err:
 import time
 import random
 import os.path
+from scipy import interpolate
 
 # get root logger, will later be redirected into a logfile
 import logging
@@ -151,8 +154,21 @@ def process_tile(tile_tuple):
     print("processing tile:", tile_info['tile_no_x'], tile_info['tile_no_y'])
     #print numpy.round(tile_elev_raster,1)
 
+    if tile_info.get("temp_file") != None:  # contains None or a file name.
+        print("Would write tile into temp. file", os.path.realpath(tile_info["temp_file"]), file=sys.stderr)
+        temp_fn = tile_info.get("temp_file")
+    else:
+        temp_fn = None # means: use memory
+
+    if os.path.exists(temp_fn):
+        print("Using previously written file", os.path.realpath(tile_info["temp_file"]), file=sys.stderr)
+        tile_info["file_size"] = os.stat(temp_fn).st_size / float(1024*1024)
+        return (tile_info, os.path.realpath(tile_info["temp_file"]))
+
     # create a bottom relief raster (values 0.0 - 1.0)
-    if tile_info["bottom_image"] != None and tile_info["no_bottom"] != None:
+    if len(tile_tuple) > 2:
+        bottom_raster = tile_tuple[2]
+    elif tile_info["bottom_image"] != None and tile_info["no_bottom"] != None:
         logger.debug("using " + tile_info["bottom_image"] + " as relief on bottom")
         bottom_raster = make_bottom_raster(tile_info["bottom_image"], tile_elev_raster.shape)
         #print "min/max:", numpy.nanmin(bottom_raster), numpy.nanmax(bottom_raster)
@@ -172,12 +188,6 @@ def process_tile(tile_tuple):
     fileformat = tile_info["fileformat"]
 
 
-    if tile_info.get("temp_file") != None:  # contains None or a file name.
-        print("Writing tile into temp. file", os.path.realpath(tile_info["temp_file"]), file=sys.stderr)
-        temp_fn = tile_info.get("temp_file")
-    else:
-        temp_fn = None # means: use memory
-
     # Create triangle "file" either in a buffer or in a tempfile
     # if file: open, write and close it, b will be temp file name
     if  fileformat == "obj":
@@ -196,7 +206,6 @@ def process_tile(tile_tuple):
         fsize = os.stat(temp_fn).st_size / float(1024*1024)
     else:
         fsize = len(b) / float(1024*1024)
-
 
     tile_info["file_size"] = fsize
     print("tile", tile_info["tile_no_x"], tile_info["tile_no_y"], fileformat, fsize, "Mb ", file=sys.stderr) #, multiprocessing.current_process()
@@ -238,27 +247,28 @@ def resampleDEM(a, factor):
     # get new shape of raster
     cursh = a.shape
     newsh = ( int(int(cursh[0]) / float(factor)), int(cursh[1] / float(factor)) )
+    print("resample0: from " + str(a.shape) + " to " + str(newsh))
 
-    #print "resample1 min/max : %.2f to %.2f" % (numpy.nanmin(a), numpy.nanmax(a))
-    has_nan = False
-    if numpy.isnan(numpy.sum(a)):
-        has_nan = True
-        nanmin = numpy.nanmin(a)
-        a = numpy.where(numpy.isnan(a), nanmin-1, a) # swap NaN to a bit smaller than valid min, so the interpolation works
-        #print "resample2 min/max : %.2f to %.2f" % (numpy.nanmin(a), numpy.nanmax(a))
+    print("resample1 min/max : %.2f to %.2f with factor %.2f" % (numpy.nanmin(a), numpy.nanmax(a), factor))
+    # has_nan = False
+    # if numpy.isnan(numpy.sum(a)):
+    #     has_nan = True
+    #     nanmin = numpy.nanmin(a)
+    #     a = numpy.where(numpy.isnan(a), nanmin-1, a) # swap NaN to a bit smaller than valid min, so the interpolation works
+    #     print("resample2 min/max : %.2f to %.2f" % (numpy.nanmin(a), numpy.nanmax(a)))
 
     # Use PIL resize with bilinear interpolation to avoid aliasing artifacts
     img = Image.fromarray(a)  # was using fromarray(a, 'F') but that affected the elevation value, which were much lower!
-    #print "pre-resam", img.size
-    #print "resamp 2.5 min/max", img.getextrema()
+    print("pre-resam", img.size)
+    print("resamp 2.5 min/max", img.getextrema())
     img  = img.resize(newsh[::-1], resample=Image.BILINEAR) # x and y are swapped in numpy
-    #print "post-resam", img.size
+    print("post-resam", img.size)
     a = numpy.asarray(img)
-    #print "resample3 min/max : %.2f to %.2f" % (numpy.nanmin(a), numpy.nanmax(a))
+    print("resample3 min/max : %.2f to %.2f" % (numpy.nanmin(a), numpy.nanmax(a)))
 
-    if has_nan:  # swap NaN back in
-        a = numpy.where(a < nanmin, numpy.nan, a)
-        #print "resample4 min/max : %.2f to %.2f" % (numpy.nanmin(a), numpy.nanmax(a))
+    # if has_nan:  # swap NaN back in
+    #     a = numpy.where(a < nanmin, numpy.nan, a)
+    #     print("resample4 min/max : %.2f to %.2f" % (numpy.nanmin(a), numpy.nanmax(a)))
 
     # fix CH Jan 2, 20: needs to be a copy, PIL locks it to read only!
     # Thanks to ljverge for finding this!
@@ -453,17 +463,17 @@ def get_zipped_tiles(DEM_name=None, trlat=None, trlon=None, bllat=None, bllon=No
     # get polygon data, either from GeoJSON or from kml URL or file
     #
     clip_poly_coords = None # list of lat/lons, will create ee.Feature used for clipping the terrain image 
-    if polygon != None: 
-        
+    if polygon != None:
+
         # If we have a GeoJSON and also a kml
-        if polyURL != None and polyURL != '': 
+        if polyURL != None and polyURL != '':
             pr("Warning: polygon via Google Drive KML will be ignored b/c a GeoJSON polygon was also given!")
         elif poly_file != None and poly_file != '':
-             pr("Warning: polygon via KML file will be ignored b/c a GeoJSON polygon was also given!")
+            pr("Warning: polygon via KML file will be ignored b/c a GeoJSON polygon was also given!")
         assert polygon.is_valid, "Error: GeoJSON polygon is not valid! (" + polygon + ")"
         clip_poly_coords = polygon["coordinates"][0] # ignore holes, which would be in 1,2, ...
         logging.info("Using GeoJSON polygon for masking with " + str(len(clip_poly_coords)) + " points")
-    
+
     # Get poly from a KML file via google drive URL
     #TODO: TEST THIS!!!!!!
     elif polyURL != None and polyURL != '':
@@ -482,12 +492,12 @@ def get_zipped_tiles(DEM_name=None, trlat=None, trlon=None, bllat=None, bllon=No
             pr("Error: GDrive kml download failed", e, " - falling back to region box", trlat, trlon, bllat, bllon)
         else:
             t = r.text
-            clip_poly_coords, msg = get_KML_poly_geometry(t) 
+            clip_poly_coords, msg = get_KML_poly_geometry(t)
             if msg != None: # Either go a line instead of polygon (take but warn) or nothing (ignore)
                 logging.warning(msg + "(" + str(len(clip_poly_coords)) + " points)")
             else:
                 logging.info("Read GDrive KML polygon with " + str(len(clip_poly_coords)) + " points from " + polyURL)
-    
+
     elif poly_file != None and poly_file != '':
         try:
             with open(poly_file, "r") as pf:
@@ -495,19 +505,19 @@ def get_zipped_tiles(DEM_name=None, trlat=None, trlon=None, bllat=None, bllon=No
         except Exception as e:
             pr("Read Error with kml file", poly_file, ":", e, " - falling back to region box", trlat, trlon, bllat, bllon)
         else:
-            clip_poly_coords, msg = get_KML_poly_geometry(poly_file_str)     
+            clip_poly_coords, msg = get_KML_poly_geometry(poly_file_str)
             if msg != None: # Either go a line instead of polygon (take but warn) or nothing (ignore)
                 logging.warning(msg + "(" + str(len(clip_poly_coords)) + " points)")
             else:
                 logging.info("Read file KML polygon with " + str(len(clip_poly_coords)) + " points from " + polyURL)
-        
+
     # overwrite trlat, trlon, bllat, bllon with bounding box around 
-    if clip_poly_coords != None: 
+    if clip_poly_coords != None:
         trlat, trlon, bllat, bllon = get_bounding_box(clip_poly_coords)
-    
+
     # end of polygon stuff
 
-
+    bottom_npim = None
 
     #
     # A) use Earth Engine to download DEM geotiff
@@ -539,7 +549,7 @@ def get_zipped_tiles(DEM_name=None, trlat=None, trlon=None, bllat=None, bllon=No
         args = locals() # dict of local variables
         dict_for_url = {} # dict with only those args that are valid for a URL query string
         for k in ("DEM_name", "trlat", "trlon", "bllat", "bllon", "printres",
-                     "ntilesx", "ntilesy", "tilewidth", "basethick", "zscale", "fileformat"):
+                  "ntilesx", "ntilesy", "tilewidth", "basethick", "zscale", "fileformat"):
             v = args[k]
             if k in ("basethick", "ntilesx", "ntilesx"):
                 v = int(v) # need to be ints to work with the JS UI
@@ -547,8 +557,8 @@ def get_zipped_tiles(DEM_name=None, trlat=None, trlon=None, bllat=None, bllon=No
             dict_for_url[k] = v
 
         # optional manual args
-        for k in ("no_bottom", "bottom_image", "ignore_leq", "lower_leq", "unprojected", 
-        		  "only", "original_query_string", "no_normals", "projection", "use_geo_coords"):
+        for k in ("no_bottom", "bottom_image", "ignore_leq", "lower_leq", "unprojected",
+                  "only", "original_query_string", "no_normals", "projection", "use_geo_coords"):
             if args.get(k) != None: # may not have been used ...
                 v = args[k]
                 pr(k, "=", v)
@@ -667,7 +677,7 @@ def get_zipped_tiles(DEM_name=None, trlat=None, trlon=None, bllat=None, bllon=No
             clip_polygon = ee.Geometry.Polygon([clip_poly_coords])
             clip_feature = ee.Feature(clip_polygon)
             image1 = image1.clip(clip_feature).unmask(-32768, False)
-             
+
         # Make a geoJSON polygon to define the area to be printed 
         reg_rect = ee.Geometry.Rectangle([[bllon, bllat], [trlon, trlat]]) # opposite corners
         if polygon == None:
@@ -683,8 +693,8 @@ def get_zipped_tiles(DEM_name=None, trlat=None, trlon=None, bllat=None, bllon=No
             'region': polygon_geojson, # geoJSON polygon
             #'crs': 'EPSG:4326',
             'crs': epsg_str, # projection
- 			# CH Mar 10, 2020: Do NOT specify the format anymore or getDownloadUrl() won't work!
- 			# apparently it's only geotiffs now
+            # CH Mar 10, 2020: Do NOT specify the format anymore or getDownloadUrl() won't work!
+            # apparently it's only geotiffs now
         }
 
         # if cellsize is <= 0, just get whatever GEE's default cellsize is (printres = -1)
@@ -745,7 +755,7 @@ def get_zipped_tiles(DEM_name=None, trlat=None, trlon=None, bllat=None, bllon=No
         # Debug: print out the data from the world file
         #worldfile = zipdir.read(zipfile.namelist()[0]) # world file as textfile
         #raster_info = [float(l) for l in worldfile.splitlines()]  # https://en.wikipedia.org/wiki/World_file
-        
+
         # geotiff as data string 
         str_data = zipdir.read(tif)
 
@@ -802,12 +812,12 @@ def get_zipped_tiles(DEM_name=None, trlat=None, trlon=None, bllat=None, bllon=No
 
             # Add GPX points to the model (thanks KohlhardtC!)
             if importedGPX != None:
-                from touchterrain.common.TouchTerrainGPX import addGPXToModel  
-                addGPXToModel(pr, npim, dem, importedGPX, 
-                              gpxPathHeight, gpxPixelsBetweenPoints, gpxPathThickness, 
-                              trlat, trlon, bllat, bllon) 
+                from touchterrain.common.TouchTerrainGPX import addGPXToModel
+                addGPXToModel(pr, npim, dem, importedGPX,
+                              gpxPathHeight, gpxPixelsBetweenPoints, gpxPathThickness,
+                              trlat, trlon, bllat, bllon)
 
-            # clip values?
+                # clip values?
             if ignore_leq != None:
                 npim = numpy.where(npim <= ignore_leq, numpy.nan, npim)
                 pr("ignoring elevations <= ", ignore_leq, " (were set to NaN)")
@@ -858,7 +868,7 @@ def get_zipped_tiles(DEM_name=None, trlat=None, trlon=None, bllat=None, bllon=No
     #
     # B) DEM data comes from a local raster file (geotiff, etc.)
     #
-    # TODO: deal with clip polygon?   
+    # TODO: deal with clip polygon?
 
     else:
 
@@ -938,20 +948,82 @@ def get_zipped_tiles(DEM_name=None, trlat=None, trlon=None, bllat=None, bllon=No
 
         # Resample raster to get requested printres?
         if printres <= 0: # use of source resolution was requested
-                pr("no resampling, using source resolution of ", source_print3D_resolution, "mm for a total model width of", print3D_width_total_mm, "mm")
-                if source_print3D_resolution < 0.2 and fileformat != "GeoTiff":
-                    pr("Warning: this print resolution of", source_print3D_resolution, "mm is pretty small for a typical nozzle size of 0.4 mm. You might want to use a printres that's just a bit smaller than your nozzle size ...")
-                print3D_resolution_mm = source_print3D_resolution
+            pr("no resampling, using source resolution of ", source_print3D_resolution, "mm for a total model width of", print3D_width_total_mm, "mm")
+            if source_print3D_resolution < 0.2 and fileformat != "GeoTiff":
+                pr("Warning: this print resolution of", source_print3D_resolution, "mm is pretty small for a typical nozzle size of 0.4 mm. You might want to use a printres that's just a bit smaller than your nozzle size ...")
+            print3D_resolution_mm = source_print3D_resolution
 
         else: # yes, resample
             scale_factor = print3D_resolution_mm / float(source_print3D_resolution)
             if scale_factor < 1.0:
                 pr("Warning: will re-sample to a resolution finer than the original source raster. Consider instead a value for printres >", source_print3D_resolution)
 
+            def expand(matrix):
+                matrix = numpy.copy(matrix)
+                extra = numpy.zeros(matrix.shape)
+                counts = numpy.zeros(matrix.shape)
+                print("beginning expansion")
+                class indexIterator:
+                    def __init__(self, indices):
+                        self.indices = indices
+                        self.index = 0
+
+                    def __iter__(self):
+                        return self
+
+                    def __next__(self):
+                        if self.index < len(self.indices):
+                            x = self.indices[self.index]
+                            self.index += 1
+                            return (x, matrix[x[0],x[1]])
+                        else:
+                            raise StopIteration
+
+                next_vals = None
+                num_next = matrix.shape[0] * matrix.shape[1]
+                for i in range(40):
+                    print("expansion step, ", i, " with {} items".format(num_next))
+                    vals = numpy.ndenumerate(matrix)
+                    if next_vals is not None:
+                        vals = next_vals
+                    counter = 0
+                    for index, val in vals:
+                        if not numpy.isnan(val):
+                            for adjacent in [[0,1],[1,0],[1,1],[0,-1],[-1,0],[-1,-1],[1,-1],[-1,1]]:
+                                newx = index[0]+adjacent[0]
+                                newy = index[1]+adjacent[1]
+                                if not (0 < newx < matrix.shape[0] and 0 < newy < matrix.shape[1]):
+                                    continue
+                                if numpy.isnan(matrix[newx,newy]):
+                                    extra[newx,newy] += val
+                                    counts[newx,newy] += 1
+                        if (counter / int(num_next/20)) % 1 == 0:
+                            print("expansion step, ", i, " progress {}% with {} updates".format(int(counter / num_next * 100.0), len(numpy.where(extra != 0)[0])))
+                        counter += 1
+                    counts = numpy.where(counts == 0, 1.0, counts)
+                    where = numpy.where(extra != 0)
+                    next_vals = indexIterator(list(zip(where[0],where[1])))
+                    num_next = len(where[0])
+                    matrix[where] = 0
+                    matrix += extra/counts
+                    extra = numpy.zeros(matrix.shape)
+                    counts = numpy.zeros(matrix.shape)
+
+                return matrix
+
             # re-sample DEM using PIL
             pr("re-sampling", filename, ":\n ", npim.shape[::-1], source_print3D_resolution, "mm ", cell_size_m, "m ", numpy.nanmin(npim), "-", numpy.nanmax(npim), "m to")
-            npim =  resampleDEM(npim, scale_factor)
+            original = numpy.copy(npim)
+            npim = expand(npim)
+            npim = resampleDEM(original, scale_factor)
 
+            # blur DEM using PIL for bottom with one tenth the resolution
+            pr("re-sampling", filename, ":\n ", npim.shape[::-1], source_print3D_resolution, "mm ", cell_size_m, "m ", numpy.nanmin(npim), "-", numpy.nanmax(npim), "m to")
+
+            bottom_npim = numpy.copy(npim)
+            bottom_npim = expand(bottom_npim)
+            bottom_npim = ndimage.filters.median_filter(bottom_npim, size=(20,20))
+            bottom_npim = numpy.where(bottom_npim <= ignore_leq, numpy.nan, bottom_npim)
 
             #
             # based on the full raster's shape and given the model width, recalc the model height
@@ -1020,7 +1092,7 @@ def get_zipped_tiles(DEM_name=None, trlat=None, trlon=None, bllat=None, bllon=No
 
         # min/max elev (all tiles)
         print(("elev min/max : %.2f to %.2f" % (numpy.nanmin(npim), numpy.nanmax(npim)))) # use nanmin() so we can use (NaN) undefs
-        
+
         if lower_leq is not None:
             assert len(lower_leq) == 2, \
                 "lower_leq should have the format [threshold, offset]. Got {}".format(lower_leq)
@@ -1038,6 +1110,7 @@ def get_zipped_tiles(DEM_name=None, trlat=None, trlon=None, bllat=None, bllon=No
         # apply z-scaling
         if zscale != 1.0:
             npim *= zscale
+            bottom_npim *= zscale
             #print "elev min/max after x%.2f z-scaling: %.2f to %.2f" % (zscale, numpy.nanmin(npim), numpy.nanmax(npim))
 
         """
@@ -1143,11 +1216,13 @@ def get_zipped_tiles(DEM_name=None, trlat=None, trlon=None, bllat=None, bllon=No
                 end_y = start_y + cells_per_tile_y + 1 + 1
 
                 tile_elev_raster = npim[start_y:end_y, start_x:end_x] #  [y,x]
+                bottom_raster = bottom_npim[start_y:end_y, start_x:end_x] #  [y,x]
                 #print tile_elev_raster.astype(int)
 
                 # Jan 2019: for some reason, changing one tile's raster in process_tile also changes parts of another
                 # tile's raster (???) So I'm making the elev arrays r/o here and make a copy in process_raster
                 tile_elev_raster.flags.writeable = False
+                bottom_raster.flags.writeable = False
 
                 # add to tile_list
                 tile_info["tile_no_x"] = tx + 1
@@ -1163,7 +1238,7 @@ def get_zipped_tiles(DEM_name=None, trlat=None, trlon=None, bllat=None, bllon=No
 
                     # store temp file names (not file objects), MP will create file objects during processing
                     my_tile_info["temp_file"]  = mytempfname
-                tile = (my_tile_info, tile_elev_raster)   # leave it to process_tile() to unwrap the info and data parts
+                tile = (my_tile_info, tile_elev_raster, bottom_raster)   # leave it to process_tile() to unwrap the info and data parts
 
                 # if we only process one tile ...
                 if process_only == None: # no only was given

@@ -1,0 +1,21 @@
+{
+"CPU_cores_to_use": 1,
+"DEM_name": "USGS/NED",
+"basethick": 2,
+"bottom_image": null,
+"fileformat": "STLb",
+"ignore_leq": 50,
+"importedDEM": "/home/stevekuznetsov/Downloads/n/CougarMountain_2016_dtm_maintainedclip_geotiff/CougarMountain_2016_dtm_maintainedclip.tif",
+"lower_leq": null,
+"max_cells_for_memory_only": 1000000,
+"no_bottom": false,
+"ntilesx": 5,
+"ntilesy": 5,
+"only": null,
+"printres": 0.035,
+"tile_centered": false,
+"tilewidth": 80,
+"unprojected": false,
+"zip_file_name": "final",
+"zscale": 2.0
+}

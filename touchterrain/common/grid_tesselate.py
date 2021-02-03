@@ -35,6 +35,7 @@ import struct # for making binary STL
 import sys
 import multiprocessing
 import tempfile
+import math
 
 # get root logger, will later be redirected into a logfile
 import logging
@@ -457,6 +458,10 @@ class grid(object):
         ro_top = top
         top = ro_top.copy() # writeable
 
+        print(top.shape)
+        bottom = np.copy(bottom)
+        print(bottom.shape)
+
         # if bottom is not an ndarray, we don't have a bottom raster, so the bottom is a constant
         if not isinstance(bottom,np.ndarray):  
             bottom = 0
@@ -470,15 +475,22 @@ class grid(object):
 
             #print top.astype(int)
             top -= float(tile_info["min_elev"]) # subtract tile-wide max from top
+            bottom -= float(tile_info["min_elev"]) # subtract tile-wide max from bottom
             #print np.nanmin(top), np.nanmax(top)
             #print top.astype(int)
             scz = 1 / float(tile_info["scale"]) * 1000.0 # scale z to mm
-            #print tile_info["scale"], tile_info["z_scale"], scz
+            print("scaling", tile_info["scale"], tile_info["z_scale"], scz)
             top *= scz * tile_info["z_scale"] # apply z-scale
+            bottom *= scz * tile_info["z_scale"] # apply z-scale
             #print top.astype(int)
             #print np.nanmin(top), np.nanmax(top)
+            print("adding base ", tile_info["base_thickness_mm"], " mm")
             top += tile_info["base_thickness_mm"] # add base thickness
+            # make positive
+            top += abs(np.nanmin(bottom))
+            bottom += abs(np.nanmin(bottom))
             print("top min/max:", np.nanmin(top), np.nanmax(top))
+            print("bottom min/max:", np.nanmin(bottom), np.nanmax(bottom))
             #print top.astype(int)
 
         else:  # using geo coords - thickness is meters)
@@ -637,18 +649,46 @@ class grid(object):
                 SEt = vertex(E, S, SWelev, self.vi)
                 SWt = vertex(W, S, SEelev, self.vi)
                 topq = quad(NEt, SEt, SWt, NWt) # with this vertex order, a certain vertex order is needed to make the 2 triangles be counter clockwise and so point outwards
-                #print topq
+                # print("top: ", topq)
 
 
                 # make bottom quad (x,y,z)
 
                 # if bottom array is not None, interpolate bottom from the given array
                 # (NaN should never occur here!)
-                if hasattr(bottom, "__len__"):#
-                    NEelev = (bottom[j+0,i+0] + bottom[j-1,i-0] + bottom[j-1,i+1] + bottom[j-0,i+1]) / 4.0
-                    NWelev = (bottom[j+0,i+0] + bottom[j+0,i-1] + bottom[j-1,i-1] + bottom[j-1,i+0]) / 4.0
-                    SEelev = (bottom[j+0,i+0] + bottom[j-0,i+1] + bottom[j+1,i+1] + bottom[j+1,i+0]) / 4.0
-                    SWelev = (bottom[j+0,i+0] + bottom[j+1,i+0] + bottom[j+1,i-1] + bottom[j+0,i-1]) / 4.0
+                if hasattr(bottom, "__len__"):
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings('error')
+                        try:
+                            if np.isnan(bottom[j-1,i]): borders["N"] = True
+                            if np.isnan(bottom[j+1,i]): borders["S"] = True
+                            if np.isnan(bottom[j,i-1]): borders["W"] = True
+                            if np.isnan(bottom[j,i+1]): borders["E"] = True
+                        except RuntimeWarning:
+                            pass # nothing wrong - just here to ignore the warning
+                    # interpolate each corner with possible NaNs, using mean()
+                    # Note: if we have 1 or more NaNs, we get a warning: warnings.warn("Mean of empty slice", RuntimeWarning)
+                    # but if the result of ANY corner is NaN (b/c it used 4 NaNs), skip this cell entirely by setting it to None instead a cell object
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings('error')
+                        NEar = np.array([bottom[j+0,i+0], bottom[j-1,i-0], bottom[j-1,i+1], bottom[j-0,i+1]])
+                        NWar = np.array([bottom[j+0,i+0], bottom[j+0,i-1], bottom[j-1,i-1], bottom[j-1,i+0]])
+                        SEar = np.array([bottom[j+0,i+0], bottom[j-0,i+1], bottom[j+1,i+1], bottom[j+1,i+0]])
+                        SWar = np.array([bottom[j+0,i+0], bottom[j+1,i+0], bottom[j+1,i-1], bottom[j+0,i-1]])
+
+                        try: # nanmean is expensive, so only use it when actually needed
+                            NEelev = np.nanmean(NEar) if np.isnan(np.sum(NEar)) else (bottom[j+0,i+0] + bottom[j-1,i-0] + bottom[j-1,i+1] + bottom[j-0,i+1]) / 4.0
+                            NWelev = np.nanmean(NWar) if np.isnan(np.sum(NWar)) else (bottom[j+0,i+0] + bottom[j+0,i-1] + bottom[j-1,i-1] + bottom[j-1,i+0]) / 4.0
+                            SEelev = np.nanmean(SEar) if np.isnan(np.sum(SEar)) else (bottom[j+0,i+0] + bottom[j-0,i+1] + bottom[j+1,i+1] + bottom[j+1,i+0]) / 4.0
+                            SWelev = np.nanmean(SWar) if np.isnan(np.sum(SWar)) else (bottom[j+0,i+0] + bottom[j+1,i+0] + bottom[j+1,i-1] + bottom[j+0,i-1]) / 4.0
+
+                        except RuntimeWarning: #  corner is surrounded by NaN eleveations - skip this cell
+                            #print(j-1, i-1, ": elevation of at least one corner of this cell is NaN - skipping cell")
+                            #print " NW",NWelev," NE", NEelev, " SE", SEelev, " SW", SWelev # DEBUG
+                            num_nans = sum(np.isnan(np.array([NEelev, NWelev, SEelev, SWelev]))) # is ANY of the corners NaN?
+                            if num_nans > 0: # yes, set cell to None and skip it ...
+                                self.cells[j-1,i-1] = None
+                                continue
                 else:
                     NEelev = NWelev = SEelev = SWelev = bottom # uniform bottom elevation, no bottom array was given
 
@@ -657,7 +697,7 @@ class grid(object):
                 SEb = vertex(E, S, SWelev, self.vi)
                 SWb = vertex(W, S, SEelev, self.vi)
                 botq = quad(NEb, NWb, SWb, SEb)
-                #print botq
+                # print("bottom: ", botq)
 
                 # in borders dict, replace any True with a quad of that wall
                 if borders["N"] == True: borders["N"] = quad(NEb, NEt, NWt, NWb)
@@ -667,7 +707,7 @@ class grid(object):
 
                 # make cell from both
                 c = cell(topq, botq, borders)
-                #print c
+                # print(c)
 
                 # DEBUG: store i,j, and central elev
                 #c.iy = j-1
